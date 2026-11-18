@@ -12,6 +12,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use ::mavlink::ardupilotmega::{GpsFixType, MavAutopilot, MavMessage, MavModeFlag, MavType};
+use mavlink_tlog::TlogSlice;
 
 use super::db;
 use super::timezone;
@@ -276,7 +277,6 @@ fn update_from_msp(code: u16, payload: &[u8], s: &mut Snap, armed: &mut bool, id
 
 /// Decode a MAVLink tlog: a sequence of `[u64 BE µs][raw frame]`. Returns (samples, identity).
 fn decode_tlog(bytes: &[u8]) -> (Vec<Sample>, Identity) {
-    let mut parser = MavParser::new();
     let mut snap = Snap::default();
     let mut armed = false;
     let mut samples = Vec::new();
@@ -285,30 +285,17 @@ fn decode_tlog(bytes: &[u8]) -> (Vec<Sample>, Identity) {
     let mut platform: u8 = 0;
     // The autopilot's (system, component) id, locked onto the first HEARTBEAT that identifies one.
     let mut fc_id: Option<(u8, u8)> = None;
-    let mut i = 0usize;
-
-    while i + 8 <= bytes.len() {
-        let ts_us = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
-        i += 8;
-        let t_ms = (ts_us / 1000) as i64;
-        // Feed bytes until exactly one frame completes (records are one frame each; well-formed logs
-        // pass CRC so `push` returns at the frame boundary). A guard prevents runaway on corruption.
-        let mut got = false;
-        let mut guard = 0;
-        while i < bytes.len() && !got && guard < 600 {
-            let b = bytes[i];
-            i += 1;
-            guard += 1;
+    // `TlogSlice` cuts the records by the frame length and checks each CRC against all.xml, so a frame the
+    // typed dialect rejects is still one whole record, and a damaged stretch is skipped up to the next
+    // valid record instead of ending the import.
+    let mut records = TlogSlice::new(bytes);
+    for record in records.by_ref() {
+        let t_ms = (record.timestamp_us / 1000) as i64;
+        // One frame per record. TUNNEL (#385) and frames the typed dialect rejects give no typed message.
+        let mut parser = MavParser::new();
+        for &b in record.frame.as_bytes() {
             let parsed = parser.push_any(b);
-            // TUNNEL (#385) — Kite's own MSP-over-MAVLink traffic, recorded into every tlog of a tunnel
-            // link. A complete record like any other (so the importer stays on the frame boundary), but
-            // not telemetry: skipped.
-            if matches!(parsed, Some(Parsed::Tunnel { .. })) {
-                got = true;
-                continue;
-            }
             if let Some(Parsed::Msg(frame)) = parsed {
-                got = true;
                 // A tlog carries every component: peripherals on the vehicle's sysid (camera, gimbal) send their own
                 // HEARTBEATs, which would make the mode flap and overwrite `variant` (the mode table). Lock onto the
                 // autopilot like the live handshake; other message types stay unfiltered, as in the live handler.
@@ -339,9 +326,10 @@ fn decode_tlog(bytes: &[u8]) -> (Vec<Sample>, Identity) {
                 }
             }
         }
-        if !got {
-            break;
-        }
+    }
+    let skipped = records.stats().skipped_bytes;
+    if skipped > 0 {
+        log::warn!("tlog import: skipped {} damaged bytes", skipped);
     }
     let fc_variant = if variant.is_empty() { None } else { Some(variant) };
     (samples, Identity { fc_variant, platform_type: platform, ..Default::default() })
@@ -840,5 +828,75 @@ mod tests {
         let (n, e) = (rec.wind_n_ms.expect("wind north"), rec.wind_e_ms.expect("wind east"));
         assert!((n - -3.0).abs() < 0.01, "wind north {n}");
         assert!((e - -5.196).abs() < 0.01, "wind east {e}");
+    }
+
+    /// Epoch timestamp (µs) of the records below; none of its bytes is a MAVLink start byte.
+    const T0_US: u64 = 1_795_000_000_000_000;
+
+    fn record(log: &mut Vec<u8>, ts_us: u64, frame: &[u8]) {
+        log.extend_from_slice(&ts_us.to_be_bytes());
+        log.extend_from_slice(frame);
+    }
+
+    fn attitude(roll: f32) -> MavMessage {
+        MavMessage::ATTITUDE(ATTITUDE_DATA { roll, ..Default::default() })
+    }
+
+    /// An mLRS radio streams MLRS_RADIO_LINK_STATS (60045), which the ardupilotmega dialect does not
+    /// have, so the typed parser rejects it. It is still one complete record: the records after it keep
+    /// their own timestamps, also when a timestamp contains 0xFD, the MAVLink 2 start byte.
+    #[test]
+    fn frames_outside_the_dialect_keep_the_record_boundary() {
+        use crate::mavlink_proto::codec;
+        const MLRS_RADIO_LINK_STATS: u32 = 60045;
+        const MLRS_RADIO_LINK_STATS_CRC_EXTRA: u8 = 14;
+        let mut seq = MavSequence::new();
+        let fc = MavHeader { system_id: 1, component_id: 1, sequence: 0 };
+        let radio = MavHeader { system_id: 1, component_id: 68, sequence: 0 };
+        let stats = codec::serialize_raw_v2(
+            &radio,
+            MLRS_RADIO_LINK_STATS,
+            MLRS_RADIO_LINK_STATS_CRC_EXTRA,
+            &[0x41; 23],
+            &mut seq,
+        );
+        let hb = heartbeat(MavType::MAV_TYPE_FIXED_WING, MavAutopilot::MAV_AUTOPILOT_ARDUPILOTMEGA, 15);
+        let ts_with_stx = ((T0_US + 200_000) & !0xFF) | 0xFD;
+
+        let mut log = Vec::new();
+        record(&mut log, T0_US, &serialize_v2(&fc, &hb, &mut seq));
+        record(&mut log, T0_US + 100_000, &stats);
+        record(&mut log, ts_with_stx, &serialize_v2(&fc, &attitude(0.1), &mut seq));
+        record(&mut log, T0_US + 300_000, &serialize_v2(&fc, &attitude(0.2), &mut seq));
+        record(&mut log, T0_US + 400_000, &stats);
+        record(&mut log, T0_US + 500_000, &serialize_v2(&fc, &attitude(0.3), &mut seq));
+
+        let (samples, _) = decode_tlog(&log);
+        let times: Vec<i64> = samples.iter().map(|s| s.t_ms).collect();
+        let expected: Vec<i64> =
+            [ts_with_stx, T0_US + 300_000, T0_US + 500_000].iter().map(|us| (us / 1000) as i64).collect();
+        assert_eq!(times, expected);
+    }
+
+    /// A tlog cut by a crash or power loss can hold a zero-filled block where the file system had not
+    /// written the data yet. The records after the damaged block must still be imported.
+    #[test]
+    fn a_damaged_block_does_not_end_the_import() {
+        let mut seq = MavSequence::new();
+        let fc = MavHeader { system_id: 1, component_id: 1, sequence: 0 };
+        let hb = heartbeat(MavType::MAV_TYPE_FIXED_WING, MavAutopilot::MAV_AUTOPILOT_ARDUPILOTMEGA, 15);
+
+        let mut log = Vec::new();
+        record(&mut log, T0_US, &serialize_v2(&fc, &hb, &mut seq));
+        record(&mut log, T0_US + 100_000, &serialize_v2(&fc, &attitude(0.1), &mut seq));
+        log.extend_from_slice(&[0u8; 4096]);
+        record(&mut log, T0_US + 5_000_000, &serialize_v2(&fc, &attitude(0.2), &mut seq));
+        record(&mut log, T0_US + 5_100_000, &serialize_v2(&fc, &attitude(0.3), &mut seq));
+
+        let (samples, _) = decode_tlog(&log);
+        let times: Vec<i64> = samples.iter().map(|s| s.t_ms).collect();
+        let expected: Vec<i64> =
+            [T0_US + 100_000, T0_US + 5_000_000, T0_US + 5_100_000].iter().map(|us| (us / 1000) as i64).collect();
+        assert_eq!(times, expected);
     }
 }

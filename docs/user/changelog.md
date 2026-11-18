@@ -452,6 +452,11 @@ inside the box of the feature release they belong to, so the notes for one relea
     Every fix of 1.0.1 and 1.0.2 is part of 2.0. This list holds what is fixed in 2.0 only.
 
     - **Replay: the altitude reference of a flight is handled more robustly.** [#320]
+    - **`.tlog` import: one damaged record ended the import.** A stretch the importer could not read
+      (a block of zeros left by a crash, for example) dropped the rest of the flight without a
+      word, and a message outside Kite's MAVLink dialect (an mLRS radio's link statistics, for
+      example) could take the records after it along or shift their timestamps. Each record is
+      now read on its own and a damaged stretch is skipped.
     - **Android: text followed the system font size, the boxes around it did not** — with a larger
       system font, labels ran out of their buttons and digits overlapped the units in number fields;
       with a smaller one everything was smaller than designed. Text now keeps its size. [#301]
